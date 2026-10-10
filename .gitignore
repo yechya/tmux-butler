@@ -1,0 +1,14 @@
+# Runtime state and logs
+daemon.log
+daemon.pid
+daemon_state.json
+incidents/
+data/*.db
+data/*.db-*
+data/workspaces.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/

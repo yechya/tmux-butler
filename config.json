@@ -1,0 +1,94 @@
+{
+  "session_name": "0",
+  "planner_window": "planner",
+  "worker_prefix": "worker-",
+  "idle_timeout_seconds": 60,
+  "incident_cooldown_seconds": 300,
+  "default_repo": "/home/test",
+  "worker_launch_cmd": "agy",
+  "auto_confirm_safe_prompts": true,
+  "role_mappings": {
+    "0": "devin",
+    "1": "codex",
+    "2": "butler",
+    "4": "claude"
+  },
+  "model_hierarchy": {
+    "tier_1_high_iq_core": {
+      "codex": {
+        "model": "GPT-6.1-Sol",
+        "strengths": [
+          "空间几何推理",
+          "3D视觉感知",
+          "点云/位姿估计",
+          "复杂机器人运动规划"
+        ],
+        "recommended_role": "空间感知与规划核心 (Spatial & Core Planner)"
+      },
+      "claude_opus": {
+        "model": "Claude Opus / Claude Code",
+        "strengths": [
+          "高智能系统架构",
+          "全景代码评审",
+          "深层漏洞挖掘",
+          "高阶决策制定"
+        ],
+        "recommended_role": "架构师与终审 (Architect & Chief Reviewer)"
+      }
+    },
+    "tier_2_workhorse_high_throughput": {
+      "devin": {
+        "model": "SWE-2 Max (Free & Unlimited)",
+        "strengths": [
+          "免费不限量",
+          "高并发吞吐主力",
+          "大批量长时测试运行",
+          "机械性大工程重构",
+          "打杂攻坚"
+        ],
+        "recommended_role": "无限算力主力执行者 (Free Infinite Workhorse)"
+      },
+      "agy": {
+        "model": "Gemini 3.8 Flash / CLI",
+        "strengths": [
+          "本地工具桥接",
+          "轻量极速调度",
+          "0-Token巡检监督",
+          "消息中继中转"
+        ],
+        "recommended_role": "调度管家 (Supervisor & Butler)"
+      }
+    }
+  },
+  "agent_signatures": {
+    "codex": [
+      "Ask Codex",
+      "codex",
+      "GPT-6.1"
+    ],
+    "devin": [
+      "SWE-2 Max",
+      "devin",
+      "subagents"
+    ],
+    "claude_code": [
+      "❯",
+      "CLAUDE.md",
+      "bypass permissions"
+    ],
+    "agy": [
+      "Antigravity CLI",
+      "agy"
+    ],
+    "pi": [
+      "pi-agent",
+      "pi"
+    ],
+    "shell": [
+      "$",
+      "#",
+      "%",
+      "➜"
+    ]
+  }
+}
