@@ -266,6 +266,15 @@ class WorkspaceManager:
         if res.returncode == 0 and res.stdout.strip():
             return False, f"Workspace has uncommitted changes. Commit or stash first."
 
+        # 检查主仓是否干净：merge 会在主仓执行 checkout + merge，
+        # 主仓有未提交改动或未解决的冲突时一律拒绝，避免污染用户工作区
+        res = _run_git(["status", "--porcelain"], cwd=repo, check=False)
+        if res.returncode == 0 and res.stdout.strip():
+            return False, (
+                "Main repo has uncommitted changes or unresolved conflicts. "
+                "Commit/stash/reset the main repo first — refusing to merge."
+            )
+
         # 检查是否有需要合并的 commits
         res = _run_git(
             ["rev-list", "--count", f"{base_branch}..{branch}"],
@@ -277,12 +286,15 @@ class WorkspaceManager:
         if not commit_message:
             commit_message = f"butler: merge {task_id}"
 
-        if strategy == "squash":
-            return self._squash_merge(task_id, repo, base_branch, branch, commit_message, registry)
-        elif strategy == "rebase":
-            return self._rebase_merge(task_id, repo, base_branch, branch, ws_path, registry)
-        else:
-            return False, f"Unknown merge strategy: {strategy}"
+        try:
+            if strategy == "squash":
+                return self._squash_merge(task_id, repo, base_branch, branch, commit_message, registry)
+            elif strategy == "rebase":
+                return self._rebase_merge(task_id, repo, base_branch, branch, ws_path, registry)
+            else:
+                return False, f"Unknown merge strategy: {strategy}"
+        except RuntimeError as e:
+            return False, f"Merge failed: {e}"
 
     def _squash_merge(self, task_id, repo, base_branch, branch, commit_message, registry):
         """Squash merge: condenses all worktree commits into a single commit on base."""
@@ -293,23 +305,30 @@ class WorkspaceManager:
         res = _run_git(["merge", "--squash", branch], cwd=repo, check=False)
         if res.returncode != 0:
             # 冲突！回退 merge，标记 BLOCKED
-            _run_git(["merge", "--abort"], cwd=repo, check=False)
-            _run_git(["checkout", base_branch], cwd=repo, check=False)
+            # 注意：merge --squash 不写 MERGE_HEAD，merge --abort 无效；
+            # 必须用 reset --merge 清理冲突 index 与工作区
+            _run_git(["reset", "--merge"], cwd=repo, check=False)
             registry[task_id]["status"] = "blocked"
             registry[task_id]["blocked_reason"] = "merge_conflict"
             registry[task_id]["blocked_at"] = datetime.now().isoformat()
             _save_workspaces(registry)
             return False, (
                 f"Squash merge conflict detected for '{task_id}'. "
-                f"Merge aborted. Worktree left intact for manual resolution. "
-                f"Task marked as BLOCKED."
+                f"Merge rolled back via reset --merge. Worktree left intact "
+                f"for manual resolution. Task marked as BLOCKED."
             )
 
         # Commit the squash
         res = _run_git(["commit", "-m", commit_message], cwd=repo, check=False)
         if res.returncode != 0:
             err = res.stderr.strip() or res.stdout.strip()
-            return False, f"Failed to commit squash merge: {err}"
+            # 清理 staged 的 squash 状态，避免污染主仓 index
+            _run_git(["reset", "--merge"], cwd=repo, check=False)
+            registry[task_id]["status"] = "blocked"
+            registry[task_id]["blocked_reason"] = "squash_commit_failed"
+            registry[task_id]["blocked_at"] = datetime.now().isoformat()
+            _save_workspaces(registry)
+            return False, f"Failed to commit squash merge (staged state rolled back): {err}"
 
         registry[task_id]["status"] = "merged"
         registry[task_id]["merged_at"] = datetime.now().isoformat()

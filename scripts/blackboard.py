@@ -42,7 +42,7 @@ TERMINAL_STATUSES = {"DONE", "CANCELLED"}
 # Kept loose intentionally — velocity over ceremony
 STATUS_TRANSITIONS = {
     "PENDING":   {"CLAIMED", "RUNNING", "BLOCKED", "CANCELLED"},
-    "CLAIMED":   {"RUNNING", "BLOCKED", "CANCELLED", "PENDING"},
+    "CLAIMED":   {"RUNNING", "DONE", "BLOCKED", "CANCELLED", "PENDING"},
     "RUNNING":   {"TESTING", "REVIEWING", "DONE", "BLOCKED", "CANCELLED"},
     "TESTING":   {"RUNNING", "REVIEWING", "DONE", "BLOCKED", "CANCELLED"},
     "REVIEWING": {"RUNNING", "DONE", "BLOCKED", "CANCELLED"},
@@ -252,11 +252,11 @@ class Blackboard:
             return False
 
         now = _now_iso()
-        self._conn.execute(
+        cur = self._conn.execute(
             "UPDATE tasks SET status='CLAIMED', assignee=?, claimed_at=?, updated_at=? WHERE task_id=? AND status='PENDING'",
             (assignee, now, now, task_id),
         )
-        if self._conn.total_changes == 0:
+        if cur.rowcount == 0:
             # Race condition: someone else claimed it first
             return False
 

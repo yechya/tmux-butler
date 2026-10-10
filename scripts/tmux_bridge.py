@@ -21,6 +21,13 @@ INCIDENTS_DIR = CONFIG_DIR / "incidents"
 # ANSI escape sequence regex
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
+# Shell commands where injected multiline text executes line-by-line
+# (no bracketed-paste handling) — used to guard send_keys/broadcast
+SHELL_COMMANDS = {
+    'sh', 'bash', 'dash', 'ash', 'zsh', 'fish', 'ksh', 'mksh',
+    'csh', 'tcsh', 'nu', 'xonsh', 'elvish', 'pwsh', 'powershell',
+}
+
 # Anchored & comprehensive prompt patterns for heterogeneous agents
 PROMPT_PATTERNS = [
     # Claude Code
@@ -37,6 +44,8 @@ PROMPT_PATTERNS = [
     # Shell prompts
     (r'^[\$#%]\s*$', 'shell_prompt'),
     (r'^[➜→⇒]\s+', 'shell_custom'),
+    # Unanchored: prefixed prompts like "(base) ➜ ~" or "user@host ➜ dir"
+    (r'[➜→⇒]\s+\S{0,80}\s*$', 'shell_custom'),
     # Interactive REPLs
     (r'^>>>\s*', 'python_repl'),
     (r'^\.\.\.\s*', 'python_continuation'),
@@ -50,7 +59,6 @@ PROMPT_PATTERNS = [
 
 DEFAULT_CONFIG = {
     "session_name": "0",
-    "planner_window": "planner",
     "worker_prefix": "worker-",
     "idle_timeout_seconds": 60,
     "worker_launch_cmd": "agy",
@@ -183,8 +191,30 @@ def detect_pane_state(target, sample_lines=25):
     }
 
 
-def send_keys(target, text, enter=True, literal=True):
-    """Send text to target pane with isolated buffer and race-condition prevention."""
+def get_pane_command(target):
+    """Return the foreground command name of the target pane (e.g. 'zsh', 'node')."""
+    res = run_tmux(
+        ["display-message", "-p", "-t", target, "#{pane_current_command}"],
+        check=False
+    )
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def send_keys(target, text, enter=True, literal=True, allow_shell=False):
+    """Send text to target pane with isolated buffer and race-condition prevention.
+
+    Guard: multiline text is refused for plain shell panes — without
+    bracketed-paste support each newline is an Enter press, so every line
+    executes as a separate command. Pass allow_shell=True to override.
+    """
+    if "\n" in text and not allow_shell:
+        cmd = get_pane_command(target)
+        if cmd in SHELL_COMMANDS:
+            raise RuntimeError(
+                f"Refusing to inject multiline text into shell pane {target} "
+                f"(foreground command: {cmd}) — each line would execute as a "
+                f"command. Pass allow_shell=True / --allow-shell to override."
+            )
     if "\n" in text or len(text) > 150:
         # 1. Use isolated unique buffer name
         buf_name = f"butler_buf_{os.getpid()}_{int(time.time()*1000)}"
@@ -251,7 +281,7 @@ def scale_worker(session=None, name=None, cmd=None):
     indices = [int(w["index"]) for w in windows if w["index"].isdigit()]
     next_idx = max(indices) + 1 if indices else 1
 
-    worker_name = name or f"worker-{next_idx}"
+    worker_name = name or f"{cfg.get('worker_prefix', 'worker-')}{next_idx}"
     worker_cmd = cmd or cfg.get("worker_launch_cmd", "bash")
 
     # Create window (use sess: to append to session instead of referencing window index 0)
@@ -297,6 +327,8 @@ def main():
     p_send.add_argument("--text", help="Text to send")
     p_send.add_argument("--file", help="File containing text to send")
     p_send.add_argument("--no-enter", action="store_true")
+    p_send.add_argument("--allow-shell", action="store_true",
+                        help="Permit multiline text into shell panes (each line executes)")
 
     # scale
     p_scale = subparsers.add_parser("scale", help="Spawn a new worker window dynamically")
@@ -353,7 +385,12 @@ def main():
         if content is None:
             print("Error: either --text or --file must be specified.", file=sys.stderr)
             sys.exit(1)
-        send_keys(args.target, content, enter=not args.no_enter)
+        try:
+            send_keys(args.target, content, enter=not args.no_enter,
+                      allow_shell=args.allow_shell)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
         print(f"Successfully sent message to {args.target} ({len(content)} chars)")
 
     elif args.action == "scale":

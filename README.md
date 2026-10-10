@@ -111,7 +111,8 @@ python3 scripts/protocol.py nudge --target 0:codex --reason "检测到静默超�
 
 ```bash
 # 后台启动守护进程（每 15 秒轮询，5 分钟同类去重抑制，自动清理旧日志）
-nohup python3 scripts/daemon.py run --interval 15 > daemon.log 2>&1 &
+# 必须加 -u（unbuffered），否则 stdout 块缓冲会让 daemon.log 长时间为空
+nohup python3 -u scripts/daemon.py run --interval 15 > daemon.log 2>&1 &
 
 # 快速单次超压缩巡检（< 20 Tokens）
 python3 scripts/daemon.py check --compact

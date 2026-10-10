@@ -42,7 +42,8 @@ AUTO_CONFIRM_TRIGGERS = [
 # kill processes, format code, discuss costs) are NOT dangerous.
 DANGEROUS_KEYWORDS = [
     r'\brm\s+-rf\s+[/~]',          # rm -rf starting from root or home
-    r'\bgit\s+push\s+.*--force\b(?!.*--force-with-lease)',  # force push (but allow --force-with-lease which is safe)
+    r'\bgit\s+push\b[^|;&]*--force(?!-with-lease)\b',      # force push (but allow --force-with-lease which is safe)
+    r'\bgit\s+push\b[^|;&]*\s-[a-zA-Z]*f',                  # short -f flag (also catches bundled -fu)
     r'\bdrop\s+(?:table|database)\b.*\bproduction\b',       # DROP on production only
     r'\bsudo\s+rm\s+-rf\s+/',       # sudo rm -rf from root
     r'\bmkfs\b|\bdd\s+if=',         # filesystem format or raw disk write
@@ -86,8 +87,41 @@ def release_pid_lock():
         pass
 
 
+def _tree_jiffies(pid):
+    """Total utime+stime jiffies across the process tree via /proc (Linux).
+
+    Returns (jiffies, n_pids) or (None, n_pids) when /proc is unavailable.
+    """
+    if not pid or not str(pid).isdigit():
+        return None, 0
+    pids = {str(pid)}
+    try:
+        res = subprocess.run(["pstree", "-p", str(pid)], capture_output=True, text=True, timeout=2)
+        if res.returncode == 0:
+            pids.update(re.findall(r'\((\d+)\)', res.stdout))
+    except Exception:
+        pass
+    total = 0
+    found = 0
+    for p in pids:
+        try:
+            with open(f"/proc/{p}/stat") as f:
+                # comm may contain spaces/parens — split after the last ')'
+                rest = f.read().rsplit(")", 1)[1].split()
+            # rest[0]=state (field 3); utime=field14 → idx 11, stime=field15 → idx 12
+            total += int(rest[11]) + int(rest[12])
+            found += 1
+        except Exception:
+            continue
+    return (total, len(pids)) if found else (None, len(pids))
+
+
 def is_process_busy(pid):
-    """Check CPU across the full process tree (depth 1, 2, 3...) via pstree or ps."""
+    """Fallback: lifetime-average CPU across the process tree via ps.
+
+    NOTE: ps %cpu is a cumulative average — kept only for non-Linux fallback.
+    Prefer _tree_jiffies deltas for instantaneous busy detection.
+    """
     if not pid or not str(pid).isdigit():
         return False
     try:
@@ -156,11 +190,12 @@ def extract_structured_summary(pane_output):
 
 
 class ButlerDaemon:
-    def __init__(self, session=None):
+    def __init__(self, session=None, read_only=False):
         self.session = tmux_bridge.get_current_session(session)
         self.config = tmux_bridge.load_config()
         self.idle_timeout = self.config.get("idle_timeout_seconds", 60)
         self.auto_confirm = self.config.get("auto_confirm_safe_prompts", True)
+        self.read_only = read_only
         self.incident_cooldown_seconds = self.config.get("incident_cooldown_seconds", 300)
         self.state = self._load_state()
         # Deduplication: {target: {incident_type: last_reported_timestamp}}
@@ -192,13 +227,37 @@ class ButlerDaemon:
         res = tmux_bridge.run_tmux(["has-session", "-t", self.session], check=False)
         return res.returncode == 0
 
+    def _is_process_busy(self, pane_pid, pane_info):
+        """Instantaneous busy check: CPU jiffies delta since last observation.
+
+        Stores cpu_jiffies/cpu_ts inside pane_info so each scan compares
+        against the previous sample. Falls back to lifetime %cpu when /proc
+        is unavailable (non-Linux). Returns False when no baseline exists yet.
+        """
+        now = time.time()
+        jiffies, _ = _tree_jiffies(pane_pid)
+        if jiffies is None:
+            return is_process_busy(pane_pid)
+        prev_j = pane_info.get("cpu_jiffies")
+        prev_t = pane_info.get("cpu_ts")
+        pane_info["cpu_jiffies"] = jiffies
+        pane_info["cpu_ts"] = now
+        if prev_j is None or prev_t is None or now <= prev_t:
+            return False
+        try:
+            hz = os.sysconf("SC_CLK_TCK")
+        except (ValueError, AttributeError):
+            hz = 100
+        rate = (jiffies - prev_j) / (hz * (now - prev_t))
+        return rate > 0.03
+
     def scan_once(self):
         now = time.time()
         self.suppressed_count = 0
         try:
             windows = tmux_bridge.list_windows(self.session)
         except Exception as e:
-            print(f"[WARN] Failed to list windows in session {self.session}: {e}", file=sys.stderr)
+            print(f"[WARN] Failed to list windows in session {self.session}: {e}", file=sys.stderr, flush=True)
             return []
 
         incidents = []
@@ -228,10 +287,13 @@ class ButlerDaemon:
 
                 # Check 1: Safe auto-confirm with security keyword blacklist
                 if self.auto_confirm and pane_state["state"] == "waiting_input":
+                    # 用真正命中提示符的那一行：带底部状态栏的 TUI 中
+                    # last_line 往往是状态栏而不是确认提示
                     last_line = pane_state["last_line"]
+                    confirm_line = pane_state.get("matched_line") or last_line
                     matched_trigger = None
                     for pat, response in AUTO_CONFIRM_TRIGGERS:
-                        if re.search(pat, last_line, re.IGNORECASE):
+                        if re.search(pat, confirm_line, re.IGNORECASE):
                             matched_trigger = (pat, response)
                             break
 
@@ -248,12 +310,24 @@ class ButlerDaemon:
                                 "idle_seconds": idle_seconds,
                                 "incident_type": "requires_human_approval",
                                 "prompt_type": pane_state["prompt_type"],
-                                "last_line": last_line,
+                                "last_line": confirm_line,
                                 "reason": "Dangerous operation detected near confirmation prompt"
+                            })
+                        elif self.read_only:
+                            incidents.append({
+                                "timestamp": datetime.now().isoformat(),
+                                "target": target,
+                                "window_name": w["name"],
+                                "window_index": w["index"],
+                                "idle_seconds": idle_seconds,
+                                "incident_type": "auto_confirmable_prompt",
+                                "prompt_type": pane_state["prompt_type"],
+                                "last_line": confirm_line,
+                                "reason": "Safe prompt detected (read-only: not confirmed)"
                             })
                         else:
                             resp = matched_trigger[1]
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] Auto-confirming safe prompt in {target}: '{last_line.strip()}' -> sending '{resp}'")
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] Auto-confirming safe prompt in {target}: '{confirm_line.strip()}' -> sending '{resp}'", flush=True)
                             tmux_bridge.send_keys(target, resp, enter=True)
                             pane_info["last_change_time"] = now
                             time.sleep(0.3)
@@ -266,7 +340,7 @@ class ButlerDaemon:
 
                     looks_completed = any(re.search(pat, tail_blob, re.IGNORECASE) for pat in TASK_COMPLETION_PATTERNS)
                     is_waiting_input = pane_state["state"] == "waiting_input"
-                    process_active = is_process_busy(pane_pid)
+                    process_active = self._is_process_busy(pane_pid, pane_info)
 
                     incident_type = None
 
@@ -309,8 +383,14 @@ class ButlerDaemon:
                 self.state.setdefault("panes", {})[target] = pane_info
 
             except Exception as e:
-                print(f"[WARN] Error scanning window {w.get('name', 'unknown')}: {e}", file=sys.stderr)
+                print(f"[WARN] Error scanning window {w.get('name', 'unknown')}: {e}", file=sys.stderr, flush=True)
                 continue
+
+        # 清掉已关闭窗口的残留状态
+        current_targets = {w["target"] for w in windows}
+        panes = self.state.get("panes", {})
+        for stale in [t for t in panes if t not in current_targets]:
+            del panes[stale]
 
         self._save_state()
 
@@ -360,12 +440,12 @@ class ButlerDaemon:
                     pass
 
     def run_loop(self, interval=15):
-        print(f"Starting tmux-butler daemon on session [{self.session}] (PID: {os.getpid()}, poll: {interval}s, idle timeout: {self.idle_timeout}s)...")
+        print(f"Starting tmux-butler daemon on session [{self.session}] (PID: {os.getpid()}, poll: {interval}s, idle timeout: {self.idle_timeout}s)...", flush=True)
         consecutive_errors = 0
         try:
             while True:
                 if not self.is_session_alive():
-                    print(f"\n[EXIT] Tmux session '{self.session}' no longer exists. Stopping daemon.")
+                    print(f"\n[EXIT] Tmux session '{self.session}' no longer exists. Stopping daemon.", flush=True)
                     break
 
                 try:
@@ -373,19 +453,19 @@ class ButlerDaemon:
                     consecutive_errors = 0
                     now_str = datetime.now().strftime("%H:%M:%S")
                     if incidents:
-                        print(f"[{now_str}] ⚠️ Detected {len(incidents)} issue(s):")
+                        print(f"[{now_str}] ⚠️ Detected {len(incidents)} issue(s):", flush=True)
                         for inc in incidents:
-                            print(f"   -> [{inc['window_name']} ({inc['target']})] {inc['incident_type']} (idle {inc['idle_seconds']}s): {inc['last_line'][:55]}")
+                            print(f"   -> [{inc['window_name']} ({inc['target']})] {inc['incident_type']} (idle {inc['idle_seconds']}s): {inc['last_line'][:55]}", flush=True)
                 except Exception as e:
                     consecutive_errors += 1
-                    print(f"[WARN] Exception in scan loop: {e}", file=sys.stderr)
+                    print(f"[WARN] Exception in scan loop: {e}", file=sys.stderr, flush=True)
                     if consecutive_errors >= 5:
-                        print(f"[EXIT] 5 consecutive failures in scan loop. Stopping daemon.", file=sys.stderr)
+                        print(f"[EXIT] 5 consecutive failures in scan loop. Stopping daemon.", file=sys.stderr, flush=True)
                         break
 
                 time.sleep(interval)
         except KeyboardInterrupt:
-            print("\nDaemon stopped gracefully by user.")
+            print("\nDaemon stopped gracefully by user.", flush=True)
 
 
 def main():
@@ -402,6 +482,8 @@ def main():
     p_check.add_argument("--session", "-s", default=None)
     p_check.add_argument("--json", action="store_true")
     p_check.add_argument("--compact", action="store_true", help="Output ultra-compact format (<50 tokens)")
+    p_check.add_argument("--read-only", action="store_true",
+                         help="Inspect only: report confirmable prompts instead of sending keys")
 
     # latest
     p_latest = subparsers.add_parser("latest", help="Show latest incident report for LLM Butler")
@@ -418,7 +500,7 @@ def main():
             release_pid_lock()
 
     elif args.action == "check":
-        daemon = ButlerDaemon(args.session)
+        daemon = ButlerDaemon(args.session, read_only=args.read_only)
         incidents = daemon.scan_once()
         if args.json:
             print(json.dumps({"incidents": incidents}, indent=2, ensure_ascii=False))

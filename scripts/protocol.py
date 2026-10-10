@@ -262,17 +262,10 @@ def _render_generic(msg: ACOMMessage) -> str:
 # Parsing (best-effort)
 # ──────────────────────────────────────────────
 
-# Header regex: ═══ [TYPE · from SENDER ...] ═══  or  ═══ [管家介入 · NUDGE] ═══
+# Header regex: matches the actual rendered form  ═══ LABEL ═══...═══
+# (_header_line emits no brackets — label is everything between the ═ padding)
 _HEADER_RE = re.compile(
-    r'═{3}\s*\[(.+?)\]\s*═*'
-)
-
-# Sub-patterns within header content
-_TYPE_SENDER_RE = re.compile(
-    r'(TASK_ASSIGN|TASK_COMPLETE|TASK_UPDATE|RELAY|BROADCAST|NUDGE|管家介入)'
-    r'(?:\s*·\s*(?:from\s+)?(\S+?))?'
-    r'(?:\s*(?:→\s*(\S+?))?)?'
-    r'(?:\s*·\s*(\S+?))?$'
+    r'═{3}\s+(.+?)\s*═*\s*$'
 )
 
 
@@ -308,8 +301,12 @@ def parse_message(text: str) -> Optional[ACOMMessage]:
             break
         body_lines.append(line)
 
-    # Parse header content
-    # Handle NUDGE special case: "管家介入 · NUDGE"
+    # Parse header content by splitting on '·' separators.
+    # Rendered forms:
+    #   TASK_ASSIGN · from claude · task-001
+    #   RELAY · claude → devin · task-007
+    #   BROADCAST · from claude
+    #   管家介入 · NUDGE
     msg_type = None
     sender = 'butler'
     recipient = 'all'
@@ -318,17 +315,23 @@ def parse_message(text: str) -> Optional[ACOMMessage]:
     if '管家介入' in header_line or header_line.strip() == 'NUDGE':
         msg_type = 'NUDGE'
     else:
-        m = _TYPE_SENDER_RE.search(header_line)
-        if m:
-            type_str = m.group(1)
-            if type_str in VALID_MSG_TYPES:
-                msg_type = type_str
-            sender = m.group(2) or sender
-            recipient = m.group(3) or recipient
-            task_id = m.group(4) or None
+        parts = [p.strip() for p in header_line.split('·')]
+        if parts[0] in VALID_MSG_TYPES:
+            msg_type = parts[0]
         else:
             # 无法识别消息类型
             return None
+        for part in parts[1:]:
+            if not part:
+                continue
+            if part.startswith('from '):
+                sender = part[5:].strip() or sender
+            elif '→' in part:
+                left, right = part.split('→', 1)
+                sender = left.strip() or sender
+                recipient = right.strip() or recipient
+            else:
+                task_id = part
 
     if msg_type is None:
         return None
@@ -440,6 +443,8 @@ def main():
     p_bcast.add_argument("--sender", default="butler", help="Sender identifier")
     p_bcast.add_argument("--content", required=True, help="Broadcast message body")
     p_bcast.add_argument("--session", "-s", default=None, help="tmux session name")
+    p_bcast.add_argument("--include-shell", action="store_true",
+                       help="Also broadcast to plain shell windows (DANGEROUS: each line executes as a command)")
     p_bcast.add_argument("--dry-run", action="store_true")
 
     # ── render ──
@@ -464,7 +469,11 @@ def main():
         if args.dry_run:
             print(rendered)
         else:
-            send_acom(args.target, msg)
+            try:
+                send_acom(args.target, msg)
+            except RuntimeError as e:
+                print(f"[ACOM] Error: {e}", file=sys.stderr)
+                sys.exit(1)
             print(f"[ACOM] Sent {args.msg_type} to {args.target} ({len(rendered)} chars)")
 
     elif args.action == "nudge":
@@ -485,7 +494,11 @@ def main():
         if args.dry_run:
             print(rendered)
         else:
-            send_acom(args.target, msg)
+            try:
+                send_acom(args.target, msg)
+            except RuntimeError as e:
+                print(f"[ACOM] Error: {e}", file=sys.stderr)
+                sys.exit(1)
             print(f"[ACOM] Nudge sent to {args.target}")
 
     elif args.action == "broadcast":
@@ -502,14 +515,22 @@ def main():
             session = tmux_bridge.get_current_session(args.session)
             windows = tmux_bridge.list_windows(session)
             sent_count = 0
+            skipped_shells = []
             for w in windows:
                 target = w["target"]
+                # 跳过普通 shell 窗口：多行文本在无 bracketed-paste 的
+                # shell 里会逐行执行，广播内容会被当作命令跑掉
+                if not args.include_shell and w.get("command") in tmux_bridge.SHELL_COMMANDS:
+                    skipped_shells.append(w["name"])
+                    continue
                 try:
                     send_acom(target, msg)
                     sent_count += 1
                 except Exception as e:
                     print(f"[WARN] Failed to send to {target}: {e}", file=sys.stderr)
             print(f"[ACOM] Broadcast sent to {sent_count}/{len(windows)} windows")
+            if skipped_shells:
+                print(f"[ACOM] Skipped shell windows: {', '.join(skipped_shells)} (use --include-shell to override)")
 
     elif args.action == "render":
         data = json.loads(args.json_str)

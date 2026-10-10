@@ -105,7 +105,8 @@ python3 ~/.gemini/config/skills/tmux-butler/scripts/protocol.py broadcast --send
 
 ```bash
 # 后台启动守护进程（每 15 秒轮询，5 分钟同类去重抑制，自动清理旧日志）
-nohup python3 ~/.gemini/config/skills/tmux-butler/scripts/daemon.py run --interval 15 > ~/.gemini/config/skills/tmux-butler/daemon.log 2>&1 &
+# 必须加 -u（unbuffered），否则 stdout 块缓冲会让 daemon.log 长时间为空
+nohup python3 -u ~/.gemini/config/skills/tmux-butler/scripts/daemon.py run --interval 15 > ~/.gemini/config/skills/tmux-butler/daemon.log 2>&1 &
 
 # 快速查看当前巡检健康度（< 20 Tokens）
 python3 ~/.gemini/config/skills/tmux-butler/scripts/daemon.py check --compact
