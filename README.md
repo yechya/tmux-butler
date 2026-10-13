@@ -1,125 +1,121 @@
 # tmux-butler
 
-> **Heterogeneous Multi-Agent Swarm Orchestration System for tmux**  
-> 专为多模型、多窗口的 tmux 异构 Agent 协作网络设计的无人值守协同操作系统。
+面向 tmux 中多个编程 Agent 的轻量协作工具：用 SQLite 跟踪任务，用 Git worktree 分离工作目录，用终端文本传递消息，并通过本地脚本检查窗口状态。
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-brightgreen.svg)](https://www.python.org/)
-[![Zero-Token](https://img.shields.io/badge/LLM%20Token-Zero%20Cost%20Inspection-orange.svg)](#)
+巡检脚本不调用模型 API；运行中的 Agent 仍可能产生模型费用。
 
----
+[MIT License](LICENSE)
 
-## 核心设计哲学 (Design Philosophy)
+## 已实现的功能
 
-1. **速度优先，安全底线兜底 (Velocity over Caution)**：
-   - 杜绝阻碍研发流程的过度防御。仅拦截致命的不可逆破坏操作（如 `rm -rf /`、强制推送保护分支、生产库 DROP、`mkfs/dd`）。
-   - 普通日常开发操作（文件删改、kill 进程、代码格式化、常规 force-with-lease）一律自动确认放行。
-2. **严格保持 Git 线性历史 (Linear History Enforcement)**：
-   - 为并发 Agent 提供临时 Git Worktree 沙箱，解决多模型写同一代码库的冲突踩踏问题。
-   - 任务完成后默认采用 `squash` 或 `rebase` 合并回主干，并立即销毁临时分支与沙箱，杜绝分支膨胀乱象。
-3. **0-Token 基础巡检与 300s 去重降噪**：
-   - 本地轻量轮询监控进程状态与 CPU 负载，零 LLM Token 消耗。
-   - 跨执行持久化的 Cooldown 机制（同一窗口同类异常 5 分钟内静默抑制），最多保留 50 份事件历史，避免磁盘洪泛。
-4. **轻量 SQLite 任务黑板 (Blackboard)**：
-   - 无任何第三方外部依赖，基于 SQLite (WAL 模式) 实现原子化认领 (`claim`)、状态流转与 `< 100 Token` 极简摘要。
-5. **ACOM 结构化跨窗口通信 (Protocol)**：
-   - 跨 Agent 结构化协议（`TASK_ASSIGN`, `TASK_UPDATE`, `TASK_COMPLETE`, `RELAY`, `NUDGE`, `BROADCAST`），终端自适应排版。
+| 工具 | 功能 |
+| --- | --- |
+| [`blackboard.py`](scripts/blackboard.py) | 任务创建、条件更新认领、状态流转、事件记录；SQLite WAL 存储 |
+| [`workspace_manager.py`](scripts/workspace_manager.py) | 创建 worktree，显式执行 squash / rebase 合并与清理；遇到合并冲突保留工作目录 |
+| [`protocol.py`](scripts/protocol.py) | 渲染、尽力解析和发送任务、进度、完成、转发、提醒与广播消息 |
+| [`tmux_bridge.py`](scripts/tmux_bridge.py) | 捕获终端输出、识别部分提示符、发送文本、重命名窗口和启动新窗口 |
+| [`daemon.py`](scripts/daemon.py) | 根据输出变化、提示符和进程活动报告疑似停滞；空闲类告警默认按窗口与类型去重 300 秒，保留最多 50 份历史报告 |
 
----
+这些工具提供协作原语，任务拆分、模型选择和结果验收仍由使用者负责。
 
-## 目录结构
+## 环境与安装
 
-```
-tmux-butler/
-├── SKILL.md                 # Agent 技能定义文件
-├── config.json              # 异构模型算力层级与窗口角色映射
-├── references/
-│   └── prompts.md           # 干预与 Nudge 提示词模板
-└── scripts/
-    ├── tmux_bridge.py       # Tmux 底层 I/O 与终端状态检测
-    ├── daemon.py            # 0-Token 巡检守护进程与去重报警
-    ├── blackboard.py        # SQLite 任务协同黑板
-    ├── workspace_manager.py # Git Worktree 沙箱隔离与线性合并
-    └── protocol.py          # ACOM 结构化消息协议
+- Linux；可在 WSL2 的 Linux 环境中使用，需自行验证完整工作流
+- Python 3.8 或更新版本；Python 代码只使用标准库，最低版本尚无 CI 覆盖
+- tmux、Git；巡检使用 `ps`，安装 `pstree` 可帮助检查子进程活动
+- Agent CLI 需另行安装。`daemon.py` 使用 `fcntl` 和 Linux 进程信息，原生 Windows 不支持该巡检流程
+
+当前代码固定读取 `~/.gemini/config/skills/tmux-butler/` 下的配置和状态，**不会自动读取任意克隆目录里的 `config.json`**。以下命令假设目标目录不存在；已有安装时先检查内容，不要覆盖。
+
+```bash
+mkdir -p "$HOME/.gemini/config/skills"
+git clone https://github.com/yechya/tmux-butler.git "$HOME/.gemini/config/skills/tmux-butler"
+cd "$HOME/.gemini/config/skills/tmux-butler"
 ```
 
----
+使用前编辑该目录的 `config.json`。建议新安装从以下配置开始：
 
-## 模型算力层级与分工矩阵
+```json
+{
+  "session_name": "butler-demo",
+  "worker_prefix": "worker-",
+  "idle_timeout_seconds": 60,
+  "incident_cooldown_seconds": 300,
+  "worker_launch_cmd": "bash",
+  "auto_confirm_safe_prompts": false,
+  "role_mappings": {}
+}
+```
 
-| 模型 / 角色 | 智力等级与核心优势 | 成本特性 | 最佳任务分工 |
-| :--- | :--- | :--- | :--- |
-| **Codex** (`GPT-6.1-Sol`) | ⭐⭐⭐⭐⭐ 空间几何推理、3D 点云与视觉感知、运动规划 | 付费/高价值 | **空间感知与规划核心**：处理复杂几何算法、位姿漂移归因 |
-| **Claude / Opus** (`Claude Code`) | ⭐⭐⭐⭐⭐ 系统架构设计、全景代码审查、复杂边界推演 | 付费/高价值 | **总架构师与评审者**：全局方案设计、接口契约终审 |
-| **Devin** (`SWE-2 Max`) | ⭐⭐⭐☆ 工程实现能力合格，持久运行稳定性好 | 🎁 免费不限量 | **高并发苦力与攻坚主力**：全套测试回归、大工程批量机械重构 |
-| **AGY / Butler** (`Gemini 3.8 Flash`) | ⭐⭐⭐☆ 极速响应、本地工具与 tmux 交互原生集成 | 极低成本/极速 | **调度管家与环境桥梁**：0-Token 巡检、黑板任务调度、安全阻断 |
+`session_name` 应指向自己的 tmux 会话；`worker_launch_cmd` 换成已安装的 Agent 命令。角色名是窗口标签，不表示模型能力。建议对工作区命令显式传入 `--repo`，不沿用示例中的机器路径。
 
----
+**自动确认默认值是 `true`，配置缺失或解析失败时也可能回退到该默认值。** 首次检查使用 `--read-only`；连续巡检前确认配置正确且自动确认已关闭。
 
 ## 快速使用
 
-### 1. 任务协同黑板 (Blackboard)
+以下命令在安装目录执行。任务黑板、消息渲染不需要运行中的 tmux 会话。
+
+### 1. 任务状态流转
 
 ```bash
-# 创建任务
-python3 scripts/blackboard.py create --title "重构点云配准异常处理" --issuer claude --assignee devin
+python3 scripts/blackboard.py create --title "验证任务状态流转" --issuer planner
 
-# 查看待办与进行中任务
-python3 scripts/blackboard.py list
-
-# Worker 原子认领任务
-python3 scripts/blackboard.py claim task-001 --assignee devin
-
-# 更新状态与产出
-python3 scripts/blackboard.py update task-001 --status DONE --note "12 项单元测试全部通过"
-
-# 获取紧凑摘要（适合注入 LLM 上下文，< 100 Tokens）
+# 将 task-001 替换为 create 输出的实际任务 ID
+python3 scripts/blackboard.py claim task-001 --assignee worker-1
+python3 scripts/blackboard.py update task-001 --status RUNNING
+python3 scripts/blackboard.py update task-001 --status DONE --note "示例任务结束"
+python3 scripts/blackboard.py show task-001
 python3 scripts/blackboard.py summary
 ```
 
-### 2. 工作区沙箱隔离与线性 Git 历史 (Workspace Manager)
+重复认领会失败。常用路径为 `PENDING → CLAIMED → RUNNING → DONE`，也可使用 `TESTING`、`REVIEWING`、`BLOCKED` 等状态。`summary` 按活跃任务输出紧凑文本，长度随任务数量增长，没有固定 token 上限。
+
+### 2. 消息预览与发送
 
 ```bash
-# 1. 为任务创建隔离沙箱
-python3 scripts/workspace_manager.py create --task-id task-001 --repo /path/to/repo
-
-# 2. Worker 在独立目录下开发完成后，squash 合并回主干（保持线性历史）
-python3 scripts/workspace_manager.py merge --task-id task-001 --message "feat: 完成点云配准重构"
-
-# 3. 销毁临时 worktree 并删除临时分支（零分支残留）
-python3 scripts/workspace_manager.py cleanup --task-id task-001
-```
-
-### 3. ACOM 跨窗口结构化通信 (Protocol)
-
-```bash
-# 下发任务给 Devin
+# 仅预览，不向任何窗口发送按键
 python3 scripts/protocol.py send \
-  --type TASK_ASSIGN \
-  --sender claude \
-  --recipient devin \
-  --task-id task-001 \
-  --content "重构点云配准异常处理并补齐边界测试" \
-  --metadata '{"working_dir": "/home/test/.tmux-butler-workspaces/task-001", "test_cmd": "pytest -v"}' \
-  --target 0:devin
-
-# 注入破死锁引导 (Nudge)
-python3 scripts/protocol.py nudge --target 0:codex --reason "检测到静默超时且 CPU 空闲"
+  --type TASK_ASSIGN --sender planner --recipient worker-1 \
+  --task-id demo-001 --content "检查示例项目并汇报结果" \
+  --target butler-demo:worker-1 --dry-run
 ```
 
-### 4. 守护巡检 (Daemon)
+确认目标窗口正在运行预期的 Agent 后，移除 `--dry-run` 才会发送消息。不要向普通 shell 粘贴多行任务文本；脚本会拒绝常见 shell 的多行注入，但这不是完整的安全隔离。
+
+### 3. 工作目录隔离
 
 ```bash
-# 后台启动守护进程（每 15 秒轮询，5 分钟同类去重抑制，自动清理旧日志）
-# 必须加 -u（unbuffered），否则 stdout 块缓冲会让 daemon.log 长时间为空
-nohup python3 -u scripts/daemon.py run --interval 15 > daemon.log 2>&1 &
+# 将 /path/to/repo 替换为实际的 Git 仓库路径
+python3 scripts/workspace_manager.py create --task-id demo-001 --repo /path/to/repo
 
-# 快速单次超压缩巡检（< 20 Tokens）
-python3 scripts/daemon.py check --compact
+# 在返回的 worktree 中修改、验证并提交；确认两个工作目录均无未提交改动
+python3 scripts/workspace_manager.py merge --task-id demo-001 --repo /path/to/repo \
+  --message "Complete demo task"
+
+# 合并成功、检查结果并确认没有新增的未提交文件后，再清理
+python3 scripts/workspace_manager.py cleanup --task-id demo-001 --repo /path/to/repo
 ```
 
----
+worktree 位于 `~/.tmux-butler-workspaces/<task-id>/`。默认 squash 合并，可用 `--strategy rebase`；清理是独立命令，不会在合并后自动执行。worktree 共享 Git 数据和用户权限，不是安全沙箱。
 
-## License
+### 4. 检查已有 tmux 会话
 
-MIT License.
+```bash
+python3 scripts/tmux_bridge.py status --session butler-demo
+python3 scripts/daemon.py check --session butler-demo --read-only --compact
+
+# 确认 config.json 中 auto_confirm_safe_prompts 为 false 后，连续巡检
+python3 -u scripts/daemon.py run --session butler-demo --interval 15
+```
+
+`--read-only` 表示不向窗口发送按键，仍会写入巡检状态和事件日志。巡检只报告疑似异常；CPU 活动或终端静默不能单独证明任务成功、失败或死锁。
+
+## 使用边界
+
+- 提示符与危险操作识别依赖文本匹配，可能漏报或误报；不应作为生产系统的授权或安全边界
+- 自动确认可能批准文件修改、进程终止等操作。仅在明确授权、可恢复的测试环境中考虑启用；部署、删除、推送等操作另行核实权限
+- 消息解析为尽力恢复，不保证所有字段和类型无损往返；发送成功也不代表对方已执行任务
+- 巡检面向每个 tmux 窗口的当前 pane，不是对所有 pane、Agent 或模型的完整监控
+- 仓库目前没有端到端测试或性能基准，不承诺固定 token 开销、吞吐量或全面的 Agent CLI 兼容性
+
+Agent 使用指引见 [`SKILL.md`](SKILL.md)，消息与人工介入示例见 [`references/prompts.md`](references/prompts.md)。
